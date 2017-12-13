@@ -49,12 +49,9 @@ def knn_strategy_batched(data_path, k, d, thresh, start_budget, batch_size):
     test_set_tensor = tf.placeholder(tf.float32, shape=[None, None])
     norm_tensor = compute_pairwise_dists(training_set_tensor, test_set_tensor)
     norm_tensor = tf.transpose(norm_tensor)
-    # norm_tensor_placeholder = tf.placeholder(tf.float32, shape=[None, None])
     norm_tensor_placeholder = tf.placeholder(tf.float32, shape=[None])
     top_k_vals_tensor, top_k_idx_tensor = tf.nn.top_k(-norm_tensor_placeholder, k)
     top_k_vals_tensor = -top_k_vals_tensor
-    # num_below_thresh_tensor = \
-    #     tf.reduce_sum(tf.cast(top_k_vals_tensor < thresh, tf.int32), axis=1)
     num_below_thresh_tensor = \
         tf.reduce_sum(tf.cast(top_k_vals_tensor < thresh, tf.int32))
 
@@ -104,16 +101,7 @@ def knn_strategy_batched(data_path, k, d, thresh, start_budget, batch_size):
                 new_samples.append(elems[j])
                 training_set_indices.append(elems_idx[j])
                 test_set_collected_samples_idx.append(j)
-        # num_below_thresh = sess.run(
-        #     num_below_thresh_tensor,
-        #     feed_dict={norm_tensor_placeholder: composite_norm_npy})
-        # new_samples = []
-        # for j, num_below in enumerate(num_below_thresh):
-        #     if num_below < d:
-        #         new_samples.append(elems[j])
-        #         training_set_indices.append(elems_idx[j])
         if len(new_samples) > 0:
-            # print('added %d new samples to training set' % len(new_samples))
             training_set = np.vstack([training_set, np.array(new_samples)])
     return training_set_indices
 
