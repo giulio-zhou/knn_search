@@ -1,3 +1,4 @@
+from networks_exp_utils.file_util import LabelIterator
 from networks_exp_utils.file_util import ShardedFileIterator
 import numpy as np
 import tensorflow as tf
@@ -39,15 +40,23 @@ def compute_pairwise_dists(X, Z):
     return D
 
 def knn_strategy_batched(data_path, k, d, thresh, start_budget, batch_size):
+    # Separate computation graph into first part that computes all pairwise
+    # norms and the second that just computes the top k. This allows us to
+    # split up the first part into sub batches to fit into GPU memory and 
+    # process the second half sequentially.
     sess = tf.Session()
     training_set_tensor = tf.placeholder(tf.float32, shape=[None, None])
     test_set_tensor = tf.placeholder(tf.float32, shape=[None, None])
     norm_tensor = compute_pairwise_dists(training_set_tensor, test_set_tensor)
-    norm_tensor_placeholder = tf.placeholder(tf.float32, shape=[None, None])
-    top_k_vals_tensor, top_k_idx_tensor = tf.nn.top_k(-tf.transpose(norm_tensor_placeholder), k)
+    norm_tensor = tf.transpose(norm_tensor)
+    # norm_tensor_placeholder = tf.placeholder(tf.float32, shape=[None, None])
+    norm_tensor_placeholder = tf.placeholder(tf.float32, shape=[None])
+    top_k_vals_tensor, top_k_idx_tensor = tf.nn.top_k(-norm_tensor_placeholder, k)
     top_k_vals_tensor = -top_k_vals_tensor
+    # num_below_thresh_tensor = \
+    #     tf.reduce_sum(tf.cast(top_k_vals_tensor < thresh, tf.int32), axis=1)
     num_below_thresh_tensor = \
-        tf.reduce_sum(tf.cast(top_k_vals_tensor < thresh, tf.int32), axis=1)
+        tf.reduce_sum(tf.cast(top_k_vals_tensor < thresh, tf.int32))
 
     data_iterator = ShardedFileIterator(data_path)
     training_set = data_iterator.get_next_entries(start_budget)
@@ -78,16 +87,31 @@ def knn_strategy_batched(data_path, k, d, thresh, start_budget, batch_size):
                                   feed_dict={training_set_tensor: training_set_slice,
                                              test_set_tensor: elems})
             norms.append(norm_slice)
+        # Compute pairwise distances among test examples.
+        test_pairwise_norms = sess.run(norm_tensor,
+                                       feed_dict={training_set_tensor: elems,
+                                                  test_set_tensor: elems})
         # Concatenate norms and compute num_below_thresh.
-        composite_norm_npy = np.vstack(norms)
-        num_below_thresh = sess.run(
-            num_below_thresh_tensor,
-            feed_dict={norm_tensor_placeholder: composite_norm_npy})
+        composite_norm_npy = np.hstack(norms)
         new_samples = []
-        for j, num_below in enumerate(num_below_thresh):
-            if num_below < d:
+        test_set_collected_samples_idx = []
+        for j, training_norms in enumerate(composite_norm_npy):
+            test_norms = test_pairwise_norms[j, test_set_collected_samples_idx]
+            num_below_thresh = sess.run(
+                num_below_thresh_tensor,
+                feed_dict={norm_tensor_placeholder: np.append(training_norms, test_norms)})
+            if num_below_thresh < d:
                 new_samples.append(elems[j])
                 training_set_indices.append(elems_idx[j])
+                test_set_collected_samples_idx.append(j)
+        # num_below_thresh = sess.run(
+        #     num_below_thresh_tensor,
+        #     feed_dict={norm_tensor_placeholder: composite_norm_npy})
+        # new_samples = []
+        # for j, num_below in enumerate(num_below_thresh):
+        #     if num_below < d:
+        #         new_samples.append(elems[j])
+        #         training_set_indices.append(elems_idx[j])
         if len(new_samples) > 0:
             # print('added %d new samples to training set' % len(new_samples))
             training_set = np.vstack([training_set, np.array(new_samples)])
@@ -134,10 +158,41 @@ def knn_strategy_batched_split(data_path, k, d, thresh, start_budget, batch_size
             print('added %d new samples to training set' % len(new_samples))
             training_set = np.vstack([training_set, np.array(new_samples)])
 
+def compute_y_means(training_idx, start_budget, batch_size, data_path):
+    data_iterator = ShardedFileIterator(data_path)
+    data_length = data_iterator.get_data_len()
+    num_batches = (data_length - start_budget) // batch_size
+    remainder = (data_length - start_budget) % batch_size
+    labels = LabelIterator(data_path)
+    labels = labels.get_next_entries(labels.get_data_len())
+    training_idx = np.array(training_idx)
+
+    ones_count = np.sum(labels[:start_budget])
+    zeros_count = start_budget - ones_count
+    y_means = [ones_count / float(start_budget)]
+    for i in range(num_batches):
+        start = start_budget + i * batch_size
+        end = start_budget + (i + 1) * batch_size
+        ys_idx = training_idx[np.where((training_idx >= start) & (training_idx < end))]
+        ys = labels[ys_idx]
+        ones_count += np.sum(ys)
+        zeros_count += len(ys) - np.sum(ys)
+        y_means.append(ones_count / float(ones_count + zeros_count))
+    if remainder > 0:
+        offset = start_budget + num_batches * batch_size
+        ys_idx = training_idx[np.where((training_idx >= start) & (training_idx < end))]
+        ys = labels[ys_idx]
+        ones_count += np.sum(ys)
+        zeros_count += len(ys) - np.sum(ys)
+        y_means.append(ones_count / float(ones_count + zeros_count))
+    return y_means
+
 def sweep_knn_strategies(data_path, output_path):
     k = 20
     d_vals = [5, 10]
-    thresh_vals = [4.5, 4.75, 5]
+    thresh_vals = [4]
+    # d_vals = [5, 10]
+    # thresh_vals = [5, 6]
     # d_vals = [5, 10, 20, 50]
     # thresh_vals = [5, 6, 7]
     start_budget = 2000
@@ -146,6 +201,9 @@ def sweep_knn_strategies(data_path, output_path):
         for thresh in thresh_vals:
             training_idx = knn_strategy_batched(
                 data_path, k, d, thresh, start_budget, batch_size)
+            # Compute mean of y's over time.
+            y_means = compute_y_means(training_idx, start_budget,
+                                      batch_size, data_path)
             with open(output_path, 'a') as outfile:
                 outfile.write(''.join(['='] * 30 + ['\n']))
                 # outfile.write('k: %d\n' % k)
@@ -155,6 +213,7 @@ def sweep_knn_strategies(data_path, output_path):
                 # outfile.write('batch_size: %d\n' % batch_size)
                 outfile.write('num indices picked: %d\n' % len(training_idx))
                 outfile.write('indices picked: %s\n' % str(training_idx))
+                outfile.write('y means: %s\n' % str(y_means))
 
 if __name__ == '__main__':
     data_path = sys.argv[1]
